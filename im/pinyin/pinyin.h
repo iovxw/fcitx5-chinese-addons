@@ -390,6 +390,16 @@ public:
     libime::PinyinContext context_;
     bool lastIsPunc_ = false;
 
+    // History of the continuous selection with the action payloads stripped:
+    // a positive value is a run of that many typed characters, 0 is a single
+    // selection and a negative value is a run of -value fixes. The fixes and
+    // the selection themselves are read back from the context, so the undo
+    // order is the exact reverse of the recorded history.
+    std::vector<int> undoStack_;
+    // selectedLength() at the previous updateUI, used to detect a new
+    // selection.
+    size_t lastSelectedLength_ = 0;
+
     PinyinMode mode_ = PinyinMode::Normal;
 
     // Forget candidate

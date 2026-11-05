@@ -335,6 +335,70 @@ PinyinState::PinyinState(PinyinEngine *engine) : context_(engine->ime()) {
     context_.setMaxSentenceLength(35);
 }
 
+namespace {
+
+// Remove the newest fix that is not covered by the current selection.
+bool undoLastFix(libime::PinyinContext &context) {
+    const auto selectedLength = context.selectedLength();
+    auto fixes = context.pinyinFixes();
+    if (fixes.empty() || fixes.back().start_ < selectedLength) {
+        return false;
+    }
+    fixes.pop_back();
+    context.setPinyinFixes(std::move(fixes));
+    return true;
+}
+
+// Undo the newest fix or selection that is still in the context. Used when
+// the recorded history is empty, e.g. after a cursor move.
+bool undoNewestAction(libime::PinyinContext &context) {
+    if (undoLastFix(context)) {
+        return true;
+    }
+    if (context.selectedLength()) {
+        context.cancel();
+        return true;
+    }
+    return false;
+}
+
+// Undo one step of the continuous selection history. A positive entry is a
+// run of typed characters, 0 is a selection and a negative entry is a run of
+// -entry fixes; the fixes and the selection themselves are read back from the
+// context.
+bool undoContinuousSelection(libime::PinyinContext &context,
+                             std::vector<int> &stack) {
+    while (!stack.empty()) {
+        const int entry = stack.back();
+        if (entry > 0) {
+            if (context.backspace()) {
+                if (--stack.back() == 0) {
+                    stack.pop_back();
+                }
+                return true;
+            }
+        } else if (entry == 0) {
+            if (context.selectedLength()) {
+                stack.pop_back();
+                context.cancel();
+                return true;
+            }
+        } else if (undoLastFix(context)) {
+            if (++stack.back() == 0) {
+                stack.pop_back();
+            }
+            return true;
+        }
+        // The entry no longer matches the context, drop it and continue with
+        // the previous one so this key press still undoes something.
+        stack.pop_back();
+    }
+
+    return undoNewestAction(context) || context.backspace();
+}
+
+} // namespace
+
 void PinyinEngine::initPredict(InputContext *inputContext) {
     auto *state = inputContext->propertyFor(&factory_);
     // clear state no matter what.
@@ -556,12 +620,33 @@ void PinyinEngine::updatePuncCandidate(
 
 void PinyinEngine::updateUI(InputContext *inputContext) {
     auto *state = inputContext->propertyFor(&factory_);
-    if (!*config_.continuousPinyinSelection &&
-        !state->context_.pinyinFixes().empty()) {
+    if (*config_.continuousPinyinSelection) {
+        const auto selectedLength = state->context_.selectedLength();
+        if (*config_.useBackSpaceToUnselect) {
+            // A cleared composition or a cursor move off the end of the
+            // input makes the recorded runs meaningless. BackSpace then falls
+            // back to the fixes and the selection still in the context.
+            if (state->context_.empty() ||
+                state->context_.cursor() != state->context_.size()) {
+                state->undoStack_.clear();
+            } else if (selectedLength > state->lastSelectedLength_) {
+                // A new selection is a structural action, so it is undone
+                // before the characters typed so far.
+                state->undoStack_.push_back(0);
+            }
+        } else {
+            state->undoStack_.clear();
+        }
+        state->lastSelectedLength_ = selectedLength;
+    } else {
+        state->undoStack_.clear();
+        state->lastSelectedLength_ = 0;
         // Turning the switch off during a composition should also drop any
         // fixes applied while it was on, so the regular tab filtering comes
         // back immediately.
-        state->context_.setPinyinFixes({});
+        if (!state->context_.pinyinFixes().empty()) {
+            state->context_.setPinyinFixes({});
+        }
     }
     inputContext->inputPanel().reset();
     // Use const ref to avoid accidentally change anything.
@@ -576,6 +661,8 @@ void PinyinEngine::updateUI(InputContext *inputContext) {
         inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
         initPredict(inputContext);
         state->context_.clear();
+        state->undoStack_.clear();
+        state->lastSelectedLength_ = 0;
         return;
     }
 
@@ -910,6 +997,15 @@ void PinyinEngine::applyPinyinFix(InputContext *inputContext,
                                         &libime::PinyinSegmentFix::start_);
     fixes.insert(pos, fix);
     context.setPinyinFixes(std::move(fixes));
+    // The fix is newer than the characters typed so far, so BackSpace removes
+    // it before touching them.
+    if (*config_.continuousPinyinSelection && *config_.useBackSpaceToUnselect) {
+        if (!state->undoStack_.empty() && state->undoStack_.back() < 0) {
+            --state->undoStack_.back();
+        } else {
+            state->undoStack_.push_back(-1);
+        }
+    }
     updateUI(inputContext);
 }
 
@@ -2295,14 +2391,29 @@ void PinyinEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
             }
         }
         event.filterAndAccept();
+        const auto sizeBefore = state->context_.size();
         if (!state->context_.type(keyStr.get())) {
             return;
+        }
+        // type() also reports true when it only cancels a selection, so make
+        // sure a character was actually added.
+        if (*config_.continuousPinyinSelection &&
+            *config_.useBackSpaceToUnselect &&
+            state->context_.size() > sizeBefore) {
+            if (!state->undoStack_.empty() && state->undoStack_.back() > 0) {
+                ++state->undoStack_.back();
+            } else {
+                state->undoStack_.push_back(1);
+            }
         }
     } else if (!state->context_.empty()) {
         // key to handle when it is not empty.
         if (event.key().check(FcitxKey_BackSpace)) {
-            if (*config_.useBackSpaceToUnselect &&
-                state->context_.selectedLength()) {
+            if (*config_.continuousPinyinSelection &&
+                *config_.useBackSpaceToUnselect) {
+                undoContinuousSelection(state->context_, state->undoStack_);
+            } else if (*config_.useBackSpaceToUnselect &&
+                       state->context_.selectedLength()) {
                 state->context_.cancel();
             } else {
                 state->context_.backspace();
@@ -2486,6 +2597,8 @@ void PinyinEngine::doReset(InputContext *inputContext) const {
     state->mode_ = PinyinMode::Normal;
     state->context_.clear();
     state->context_.clearContextWords();
+    state->undoStack_.clear();
+    state->lastSelectedLength_ = 0;
     state->predictWords_.reset();
     inputContext->inputPanel().reset();
     inputContext->updatePreedit();
@@ -2655,6 +2768,8 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
         }
     }
     state->context_.clear();
+    state->undoStack_.clear();
+    state->lastSelectedLength_ = 0;
     inputContext->commitString(selected + word);
     inputContext->inputPanel().reset();
     if (result.has_value()) {
