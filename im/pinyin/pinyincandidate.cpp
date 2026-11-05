@@ -10,6 +10,7 @@
 #include "pinyin.h"
 #include "pinyinhelper_public.h"
 #include <algorithm>
+#include <array>
 #include <boost/container_hash/hash.hpp>
 #include <cassert>
 #include <cstddef>
@@ -35,6 +36,7 @@
 #include <libime/pinyin/pinyinencoder.h>
 #include <libime/pinyin/shuangpinprofile.h>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -116,6 +118,70 @@ bestMatchPinyin(std::string_view pinyin, std::string_view candidatePinyin,
         PinyinCacheKey{std::string(pinyin), std::string(candidatePinyin)}, syl);
 
     return syl;
+}
+
+constexpr size_t pinyinMaxLength = 6;
+
+// Levenshtein distance for the fragments compared by the tab ordering, which
+// never exceed pinyinMaxLength. The fixed matrix keeps the computation
+// on the stack.
+constexpr size_t pinyinEditDistance(std::string_view lhs,
+                                    std::string_view rhs) {
+    assert(lhs.size() <= pinyinMaxLength && rhs.size() <= pinyinMaxLength);
+    std::array<std::array<size_t, pinyinMaxLength + 1>, pinyinMaxLength + 1>
+        dp{};
+
+    for (size_t i = 0; i <= lhs.size(); ++i) {
+        dp[i][0] = i;
+    }
+    for (size_t j = 0; j <= rhs.size(); ++j) {
+        dp[0][j] = j;
+    }
+    for (size_t i = 1; i <= lhs.size(); ++i) {
+        for (size_t j = 1; j <= rhs.size(); ++j) {
+            dp[i][j] = std::min(
+                {dp[i - 1][j] + 1, dp[i][j - 1] + 1,
+                 dp[i - 1][j - 1] + (lhs[i - 1] == rhs[j - 1] ? 0 : 1)});
+        }
+    }
+    return dp[lhs.size()][rhs.size()];
+}
+
+// Whether the input after a tab starts with a complete syllable. A split such
+// as "xi'an" counts as complete, while the Inner-only "xia'n" split does not.
+bool remainderStartsComplete(const libime::SegmentGraphBase &graph,
+                             size_t tabStart,
+                             const libime::PinyinSegmentFix &fix,
+                             const libime::PinyinContext &context) {
+    assert(!context.useShuangpin());
+    const size_t relEnd = fix.end_ - tabStart;
+    if (relEnd >= graph.size()) {
+        return true;
+    }
+
+    const auto &node = graph.node(relEnd);
+    for (const auto &next : node.nexts()) {
+        const auto segment = graph.segment(node, next);
+        if (segment.starts_with('\'')) {
+            return true;
+        }
+
+        const auto readings =
+            libime::PinyinEncoder::stringToSyllablesWithFuzzyFlags(
+                segment, context.ime()->correctionProfile().get(),
+                context.ime()->fuzzyFlags());
+        for (const auto &[initial, finals] : readings) {
+            for (const auto &[final, fuzzy] : finals) {
+                // Only a real final counts as a complete syllable.
+                // Exclude initial-only and letter-fallback readings.
+                if (final != libime::PinyinFinal::Invalid &&
+                    !libime::PinyinEncoder::isFinalLetter(final)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 bool isSinglePinyin(const libime::PinyinContext &context, size_t idx) {
@@ -287,7 +353,10 @@ void buildContinuousTabActions(libime::PinyinContext &context,
     if (tabStart >= fullInput.size()) {
         return;
     }
-    std::string remaining(fullInput.substr(tabStart));
+    // One tab page never consumes more than a few syllables; cap the parse
+    // window so a long run of input still resolves to a bounded graph.
+    std::string remaining(fullInput.substr(
+        tabStart, std::min(fullInput.size() - tabStart, pinyinMaxLength)));
     auto graph =
         context.useShuangpin()
             ? libime::PinyinEncoder::parseUserShuangpin(
@@ -323,6 +392,64 @@ void buildContinuousTabActions(libime::PinyinContext &context,
                           });
             }
         }
+    }
+
+    // Order the tabs by how closely they match the input they consume. This
+    // keeps the exact reading first and ranks keyboard corrections and
+    // different splits after it. Shuangpin is left in graph order for now.
+    if (!context.useShuangpin() && actions.size() > 1) {
+        struct TabSortEntry {
+            size_t distance;
+            size_t spanLength;
+            bool remainderComplete;
+            size_t oldId;
+
+            auto key() const {
+                return std::tuple{distance,
+                                  -static_cast<std::int64_t>(spanLength),
+                                  !remainderComplete, oldId};
+            }
+        };
+
+        std::vector<TabSortEntry> entries;
+        entries.reserve(actions.size());
+        std::optional<size_t> lastEnd;
+        bool lastRemainderComplete = true;
+        for (size_t id = 0; id < actions.size(); ++id) {
+            const auto &fix = fixes[id];
+            const auto raw =
+                fullInput.substr(fix.start_, fix.end_ - fix.start_);
+
+            // Tabs of the same span are appended contiguously by the loop
+            // above, so reuse the previous result.
+            bool remainderComplete;
+            if (lastEnd && *lastEnd == fix.end_) {
+                remainderComplete = lastRemainderComplete;
+            } else {
+                remainderComplete =
+                    remainderStartsComplete(graph, tabStart, fix, context);
+                lastEnd = fix.end_;
+                lastRemainderComplete = remainderComplete;
+            }
+
+            entries.push_back({pinyinEditDistance(raw, actions[id].text()),
+                               fix.end_ - fix.start_, remainderComplete, id});
+        }
+        std::ranges::sort(entries, {}, &TabSortEntry::key);
+
+        std::vector<CandidateAction> newActions;
+        std::vector<libime::PinyinSegmentFix> newFixes;
+        newActions.reserve(entries.size());
+        newFixes.reserve(entries.size());
+
+        for (const auto &entry : entries) {
+            newActions.push_back(std::move(actions[entry.oldId]));
+            newFixes.push_back(std::move(fixes[entry.oldId]));
+            newActions.back().setId(static_cast<int>(newActions.size() - 1));
+        }
+
+        actions = std::move(newActions);
+        fixes = std::move(newFixes);
     }
 }
 
