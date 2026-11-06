@@ -366,6 +366,16 @@ void buildContinuousTabActions(libime::PinyinContext &context,
                   std::move(remaining),
                   context.ime()->correctionProfile().get(),
                   context.ime()->fuzzyFlags());
+    // Force split points that parseUserPinyin won't produce
+    // e.g. "g" in "ga" and "sh" in "sha"
+    graph.addNext(0, 1);
+    if (graph.data().size() >= 2) {
+        const auto initial =
+            libime::PinyinEncoder::stringToInitial(graph.data().substr(0, 2));
+        if (initial != libime::PinyinInitial::Invalid) {
+            graph.addNext(0, 2);
+        }
+    }
 
     const auto *start = &graph.node(0);
     for (const auto &next : start->nexts()) {
@@ -436,6 +446,16 @@ void buildContinuousTabActions(libime::PinyinContext &context,
                                fix.end_ - fix.start_, remainderComplete, id});
         }
         std::ranges::sort(entries, {}, &TabSortEntry::key);
+
+        // Different fixes may render as the same tab text (e.g. the fuzzy
+        // "sh" reading of "s" and the actual "sh" split both show "sh").
+        // Keep the first one in sorted order: distance is the primary key,
+        // and distance 0 means raw == text, so an exact match always comes
+        // before the other duplicates.
+        std::unordered_set<std::string> seenTexts;
+        std::erase_if(entries, [&](const TabSortEntry &entry) {
+            return !seenTexts.insert(actions[entry.oldId].text()).second;
+        });
 
         std::vector<CandidateAction> newActions;
         std::vector<libime::PinyinSegmentFix> newFixes;
